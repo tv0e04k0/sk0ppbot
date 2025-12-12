@@ -1,9 +1,4 @@
-cd /root/sk0ppbot || exit 1
-rm -f bot.py
-python3 - <<'PY'
-from pathlib import Path
-parts = []
-parts.append("""import asyncio
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -14,17 +9,22 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
 
+# ================== CONFIG ==================
 TELEGRAM_BOT_TOKEN = "7920867738:AAEPm12lCBpq5WxZUiC9MF0Yv--EW5sL4kQ"
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5:1.5b"
 FALLBACK_MODEL = "qwen2.5:1.5b"
 
-SYSTEM_PROMPT = "Отвечай на русском. Кратко, структурно, без воды. Если не уверен — так и скажи."
+SYSTEM_PROMPT = (
+    "Отвечай на русском. Кратко, структурно, без воды. "
+    "Если не уверен — прямо так и скажи."
+)
 
 MAX_HISTORY_MESSAGES = 12
 WINDOW_SEC = 10
 MAX_MSG_PER_WINDOW = 4
+# ============================================
 
 
 @dataclass
@@ -67,7 +67,11 @@ class OllamaClient:
             raise RuntimeError("HTTP session not started")
 
         url = f"{self.base_url}/api/chat"
-        payload = {"model": model, "messages": messages, "stream": False}
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+        }
 
         last_err: Exception | None = None
         for attempt in (1, 2):
@@ -85,7 +89,10 @@ class OllamaClient:
         raise RuntimeError(f"Ollama error: {last_err}")
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("sk0ppbot")
 
 bot = Bot(TELEGRAM_BOT_TOKEN)
@@ -96,7 +103,7 @@ rl = RateLimiter(WINDOW_SEC, MAX_MSG_PER_WINDOW)
 ollama = OllamaClient(OLLAMA_URL)
 
 
-def st(chat_id: int) -> ChatState:
+def get_state(chat_id: int) -> ChatState:
     if chat_id not in states:
         states[chat_id] = ChatState()
     return states[chat_id]
@@ -128,29 +135,29 @@ async def on_shutdown():
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    state = st(message.chat.id)
-    state.history = []
+    state = get_state(message.chat.id)
+    state.history.clear()
     state.model = DEFAULT_MODEL
     await message.answer(
-        "Готов.\\n"
-        f"Модель: {state.model}\\n"
-        "Команды:\\n"
-        "/model — показать модель\\n"
-        "/model <name> — сменить модель\\n"
+        "Готов.\n"
+        f"Модель: {state.model}\n"
+        "Команды:\n"
+        "/model — показать модель\n"
+        "/model <name> — сменить модель\n"
         "/reset — сбросить контекст"
     )
 
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message):
-    state = st(message.chat.id)
-    state.history = []
+    state = get_state(message.chat.id)
+    state.history.clear()
     await message.answer("Контекст сброшен.")
 
 
 @dp.message(Command("model"))
 async def cmd_model(message: Message):
-    state = st(message.chat.id)
+    state = get_state(message.chat.id)
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) == 1:
         await message.answer(f"Текущая модель: {state.model}")
@@ -165,7 +172,7 @@ async def cmd_model(message: Message):
 
 @dp.message(F.text)
 async def on_text(message: Message):
-    state = st(message.chat.id)
+    state = get_state(message.chat.id)
 
     if not rl.allow(state):
         await message.answer(f"Слишком часто. Подожди {WINDOW_SEC} сек.")
@@ -181,7 +188,12 @@ async def on_text(message: Message):
     try:
         answer = await ollama.chat(state.model, messages)
     except Exception as e:
-        log.warning("Primary failed model=%s err=%s; fallback=%s", state.model, e, FALLBACK_MODEL)
+        log.warning(
+            "Primary failed model=%s err=%s; fallback=%s",
+            state.model,
+            e,
+            FALLBACK_MODEL,
+        )
         try:
             answer = await ollama.chat(FALLBACK_MODEL, messages)
         except Exception as e2:
@@ -201,7 +213,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-""")
-Path("bot.py").write_text("".join(parts), encoding="utf-8")
-print("OK: rebuilt bot.py")
-PY
