@@ -3,6 +3,17 @@ import logging
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# --- env ---
+load_dotenv(Path(__file__).with_name('.env'))
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError('TELEGRAM_BOT_TOKEN is not set')
+# ------------
+
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -10,7 +21,6 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 # ================== CONFIG ==================
-TELEGRAM_BOT_TOKEN = "7920867738:AAEPm12lCBpq5WxZUiC9MF0Yv--EW5sL4kQ"
 
 OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "qwen2.5:1.5b"

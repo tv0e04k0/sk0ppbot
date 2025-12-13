@@ -4,3 +4,6 @@ __pycache__/
 bot.log
 *.log
 .env
+.env
+.venv/
+__pycache__/
