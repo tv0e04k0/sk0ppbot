@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "telegram-bot-analyzer": {
+      "url": "http://37.230.117.176:3001/mcp"
+    }
+  }
+}
