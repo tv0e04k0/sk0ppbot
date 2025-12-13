@@ -22,9 +22,9 @@ from aiogram.types import Message
 
 # ================== CONFIG ==================
 
-OLLAMA_URL = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "qwen2.5:1.5b"
-FALLBACK_MODEL = "qwen2.5:1.5b"
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "qwen2.5:1.5b")
+FALLBACK_MODEL = os.getenv("FALLBACK_MODEL", DEFAULT_MODEL)
 
 SYSTEM_PROMPT = (
     "Отвечай на русском. Кратко, структурно, без воды. "
@@ -34,6 +34,10 @@ SYSTEM_PROMPT = (
 MAX_HISTORY_MESSAGES = 12
 WINDOW_SEC = 10
 MAX_MSG_PER_WINDOW = 4
+
+# Лимиты входа/контекста (грубая оценка по символам)
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "4000"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "24000"))
 
 # Ограничения для памяти (states)
 STATE_TTL_SEC = 24 * 60 * 60  # 24 часа без активности — удалить
@@ -115,6 +119,7 @@ bot = Bot(TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
 
 states: Dict[int, ChatState] = {}
+locks: Dict[int, asyncio.Lock] = {}
 rl = RateLimiter(WINDOW_SEC, MAX_MSG_PER_WINDOW)
 ollama = OllamaClient(OLLAMA_URL)
 _gc_task: asyncio.Task | None = None
@@ -126,6 +131,14 @@ def get_state(chat_id: int) -> ChatState:
     st = states[chat_id]
     st.last_seen = time.time()
     return st
+
+
+def get_lock(chat_id: int) -> asyncio.Lock:
+    lock = locks.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[chat_id] = lock
+    return lock
 
 
 def gc_states(now: float | None = None) -> int:
@@ -179,10 +192,29 @@ def trim_history(hist: List[dict]) -> List[dict]:
     return msgs[-MAX_HISTORY_MESSAGES:]
 
 
+def trim_history_by_chars(hist: List[dict], max_chars: int) -> List[dict]:
+    """
+    Подрезает историю так, чтобы суммарный размер content (user+assistant) не превышал max_chars.
+    Идёт с конца (самое новое важнее).
+    """
+    items = [m for m in hist if m.get("role") in ("user", "assistant")]
+    total = 0
+    kept: List[dict] = []
+    for m in reversed(items):
+        content = (m.get("content") or "")
+        total += len(content)
+        if total > max_chars:
+            break
+        kept.append(m)
+    kept.reverse()
+    return kept
+
+
 def build_messages(state: ChatState, user_text: str) -> List[dict]:
     base = [{"role": "system", "content": SYSTEM_PROMPT}]
-    hist = [m for m in state.history if m.get("role") in ("user", "assistant")]
-    hist = hist[-MAX_HISTORY_MESSAGES:]
+    hist = trim_history(state.history)
+    # Подрезаем ещё и по символам, чтобы не раздувать контекст
+    hist = trim_history_by_chars(hist, MAX_CONTEXT_CHARS)
     return base + hist + [{"role": "user", "content": user_text}]
 
 
@@ -262,50 +294,58 @@ async def cmd_model(message: Message):
 @dp.message(F.text)
 async def on_text(message: Message):
     try:
-        state = get_state(message.chat.id)
+        chat_id = message.chat.id
+        # последовательная обработка по чату: защищает историю и порядок ответов
+        async with get_lock(chat_id):
+            state = get_state(chat_id)
 
-        # периодическая подрезка памяти без ожидания (быстро)
-        try:
-            if len(states) > MAX_CHAT_STATES:
-                gc_states()
-        except Exception:
-            pass
-
-        if not rl.allow(state):
-            await safe_answer(message, f"Слишком часто. Подожди {WINDOW_SEC} сек.")
-            return
-
-        user_text = (message.text or "").strip()
-        if not user_text:
-            return
-
-        try:
-            await message.chat.do("typing")
-        except Exception:
-            pass
-
-        messages = build_messages(state, user_text)
-
-        try:
-            answer = await ollama.chat(state.model, messages)
-        except Exception as e:
-            log.warning(
-                "Primary failed model=%s err=%s; fallback=%s",
-                state.model,
-                e,
-                FALLBACK_MODEL,
-            )
+            # периодическая подрезка памяти без ожидания (быстро)
             try:
-                answer = await ollama.chat(FALLBACK_MODEL, messages)
-            except Exception as e2:
-                await safe_answer(message, f"Ошибка Ollama: {str(e2)[:600]}")
+                if len(states) > MAX_CHAT_STATES:
+                    gc_states()
+            except Exception:
+                pass
+
+            if not rl.allow(state):
+                await safe_answer(message, f"Слишком часто. Подожди {WINDOW_SEC} сек.")
                 return
 
-        state.history.append({"role": "user", "content": user_text})
-        state.history.append({"role": "assistant", "content": answer})
-        state.history = trim_history(state.history)
+            user_text = (message.text or "").strip()
+            if not user_text:
+                return
+            if len(user_text) > MAX_INPUT_CHARS:
+                await safe_answer(message, f"Слишком длинное сообщение. Максимум {MAX_INPUT_CHARS} символов.")
+                return
 
-        await safe_answer(message, (answer or "Пустой ответ.")[:4000])
+            try:
+                await message.chat.do("typing")
+            except Exception:
+                pass
+
+            messages = build_messages(state, user_text)
+
+            try:
+                answer = await ollama.chat(state.model, messages)
+            except Exception as e:
+                log.warning(
+                    "Primary failed model=%s err=%s; fallback=%s",
+                    state.model,
+                    e,
+                    FALLBACK_MODEL,
+                )
+                try:
+                    answer = await ollama.chat(FALLBACK_MODEL, messages)
+                except Exception as e2:
+                    await safe_answer(message, f"Ошибка Ollama: {str(e2)[:600]}")
+                    return
+
+            state.history.append({"role": "user", "content": user_text})
+            state.history.append({"role": "assistant", "content": answer})
+            state.history = trim_history(state.history)
+            # Подрезка по символам тоже, чтобы память не раздувалась “длинными” сообщениями
+            state.history = trim_history_by_chars(state.history, MAX_CONTEXT_CHARS)
+
+            await safe_answer(message, (answer or "Пустой ответ.")[:4000])
     except Exception as e:
         log.exception("on_text error: %s", e)
         await safe_answer(message, "Внутренняя ошибка. Попробуй ещё раз.")
